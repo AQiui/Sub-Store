@@ -12,5 +12,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: carsteneu/mystarhistory@v1
         with:
-          repos: ${{ github.repository }}
+          repos: sub-store-org/Sub-Store
           token: ${{ secrets.STAR_HISTORY_TOKEN || github.token }}
