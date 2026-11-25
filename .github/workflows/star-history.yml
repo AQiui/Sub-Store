@@ -13,4 +13,4 @@ jobs:
       - uses: carsteneu/mystarhistory@v1
         with:
           repos: ${{ github.repository }}
-          token: ${{ secrets.STAR_HISTORY_TOKEN }}
+          token: ${{ secrets.STAR_HISTORY_TOKEN || github.token }}
