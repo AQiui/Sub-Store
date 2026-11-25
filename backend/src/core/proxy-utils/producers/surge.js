@@ -1,7 +1,8 @@
 import _ from 'lodash';
-import { Result, isPresent } from './utils';
+import { Result, isPresent, supportsVlessTransportSecurity } from './utils';
 import { isNotBlank, getIfNotBlank, isPlainObject } from '@/utils';
 import $ from '@/core/app';
+import { isMihomoEchEnabled, normalizeInlineEchConfigList } from '../ech-utils';
 import { SURGE_XHTTP_FIELDS } from '../surge-xhttp';
 import { formatSurgeVmessEncryptMethod } from '../vmess-security';
 
@@ -67,6 +68,46 @@ function appendAlpn(result, proxy) {
     if (alpn) result.append(`,alpn="${alpn}"`);
 }
 
+function appendClientFingerprint(result, proxy) {
+    if (
+        proxy.network === 'h3' ||
+        ['tuic', 'hysteria2', 'masque-surge'].includes(proxy.type)
+    ) {
+        return;
+    }
+
+    const value =
+        proxy._surge_client_fingerprint ?? proxy['client-fingerprint'];
+    if (typeof value !== 'string') return;
+
+    let fingerprint = value.trim().toLowerCase();
+    if (!['auto', 'none', 'apple-26', 'chromium-155'].includes(fingerprint)) {
+        const family = fingerprint
+            .replace(/^hello/, '')
+            .split(/[-_]/, 1)[0]
+            .replace(/([a-z])\d+$/, '$1');
+        if (['chrome', 'edge', 'android', '360', 'qq'].includes(family)) {
+            fingerprint = 'chromium-155';
+        } else if (['safari', 'ios'].includes(family)) {
+            fingerprint = 'apple-26';
+        } else if (
+            [
+                'firefox',
+                'golang',
+                'random',
+                'randomized',
+                'randomizedalpn',
+                'randomizednoalpn',
+            ].includes(family)
+        ) {
+            fingerprint = 'auto';
+        } else {
+            return;
+        }
+    }
+    result.append(`,client-fingerprint=${fingerprint}`);
+}
+
 function getShadowTLSAlpn(proxy) {
     return formatSurgeAlpn(proxy?.['plugin-opts']?.alpn ?? proxy?.alpn);
 }
@@ -125,6 +166,25 @@ function appendTlsProxyParams(result, proxy, enabled = true) {
         isPresent(proxy, 'client-cert')
     ) {
         result.append(`,client-cert=${quoteSurgeValue(clientCert)}`);
+    }
+    appendClientFingerprint(result, proxy);
+
+    const echOpts = isPlainObject(proxy['ech-opts'])
+        ? proxy['ech-opts']
+        : undefined;
+    const echEnabled = echOpts
+        ? isMihomoEchEnabled(echOpts.enable)
+        : isNotBlank(proxy._echConfigList);
+    if (echEnabled && !proxy['reality-opts']) {
+        const config = normalizeInlineEchConfigList(
+            echOpts ? echOpts.config : proxy._echConfigList,
+        );
+        if (!config) {
+            throw unsupported(
+                'Surge ECH requires an inline ECHConfigList in base64 or base64url',
+            );
+        }
+        result.append(`,ech-config=${config}`);
     }
 }
 
@@ -330,6 +390,7 @@ function shadowsocks(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -388,6 +449,7 @@ function trojan(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -438,6 +500,7 @@ function anytls(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -507,6 +570,7 @@ function trusttunnel(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -621,6 +685,7 @@ function h2Connect(proxy) {
     appendShadowTLS(result, proxy);
 
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
     result.appendIfPresent(
         `,underlying-proxy=${proxy['underlying-proxy']}`,
         'underlying-proxy',
@@ -687,6 +752,7 @@ function v2ray(proxy, includeUnsupportedProxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -701,22 +767,13 @@ function appendVlessParams(result, proxy) {
     const network = proxy.network ?? 'tcp';
     const reality = proxy['reality-opts'];
     const tls = proxy.tls || reality;
-    const encrypted =
-        isNotBlank(proxy.encryption) && proxy.encryption.trim() !== 'none';
     if (!['tcp', 'raw', 'none', 'ws', 'grpc', 'xhttp'].includes(network)) {
         throw unsupported(`VLESS network ${network} is unsupported`);
     }
     if (proxy.encryption && /[,\r\n"']/.test(proxy.encryption)) {
         throw unsupported('VLESS encryption contains unsupported characters');
     }
-    const supportsVision =
-        network !== 'grpc' &&
-        (encrypted || (tls && network !== 'ws' && network !== 'xhttp'));
-    if (
-        (network === 'ws' && reality) ||
-        (network === 'grpc' && !tls) ||
-        (proxy.flow && !supportsVision)
-    ) {
+    if (!supportsVlessTransportSecurity(proxy)) {
         throw unsupported(
             'Unsupported VLESS transport, TLS or flow combination',
         );
@@ -747,6 +804,7 @@ function appendVlessParams(result, proxy) {
         }
         result.appendIfPresent(`,sni="${proxy.sni}"`, 'sni');
         appendAlpn(result, proxy);
+        appendClientFingerprint(result, proxy);
     } else {
         result.appendIfPresent(`,tls=${proxy.tls}`, 'tls');
         appendTlsProxyParams(result, proxy, Boolean(tls));
@@ -846,6 +904,7 @@ function ssh(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -900,6 +959,7 @@ function http(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -1005,6 +1065,7 @@ function socks5(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -1101,6 +1162,7 @@ function snell(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -1244,6 +1306,7 @@ function wireguard(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(
@@ -1333,6 +1396,7 @@ function wireguard_surge(proxy) {
 
     // block-quic
     result.appendIfPresent(`,block-quic=${proxy['block-quic']}`, 'block-quic');
+    result.appendIfPresent(`,ecn=${proxy.ecn}`, 'ecn');
 
     // underlying-proxy
     result.appendIfPresent(

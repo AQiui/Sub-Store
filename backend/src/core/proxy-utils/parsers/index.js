@@ -25,7 +25,11 @@ import {
     normalizeXhttpStrictPositiveRangeString,
     normalizeXhttpStrictPositiveRangeValue,
 } from '../xhttp-utils';
-import { extractPathQueryParam, getPathQueryParam } from '../transport-path';
+import {
+    extractPathQueryParam,
+    getPathQueryParam,
+    splitQueryPart,
+} from '../transport-path';
 import {
     buildMihomoEchOptsFromXrayFields,
     isSupportedXrayEchConfigList,
@@ -191,6 +195,13 @@ function URI_PROXY() {
             password:
                 password != null ? decodeURIComponent(password) : undefined,
         };
+
+        if (tls && query) {
+            const fingerprint =
+                getPathQueryParam(query, 'fp') ||
+                getPathQueryParam(query, 'client-fingerprint');
+            if (fingerprint) proxy['client-fingerprint'] = fingerprint;
+        }
 
         return proxy;
     };
@@ -900,7 +911,8 @@ function URI_VMess() {
                 }
             }
 
-            proxy['client-fingerprint'] = params.fp;
+            proxy['client-fingerprint'] =
+                params.fp ?? params['client-fingerprint'];
             proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
             // 然而 wiki 和 app 实测中都没有字段表示这个
             // proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.allowInsecure);
@@ -1882,7 +1894,7 @@ function URI_VLESS() {
                 proxy.flow = flow;
             }
         }
-        proxy['client-fingerprint'] = params.fp;
+        proxy['client-fingerprint'] = params.fp ?? params['client-fingerprint'];
         proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
         proxy['skip-cert-verify'] =
             /(TRUE)|1/i.test(params.allowInsecure) ||
@@ -2180,6 +2192,75 @@ function URI_AnyTLS() {
             delete proxy.security;
         }
         return proxy;
+    };
+    return { name, test, parse };
+}
+function URI_Mieru() {
+    const name = 'URI Mieru Parser';
+    const test = (line) => /^mierus:\/\//i.test(line);
+    const parse = (line) => {
+        const { content, fragment } = splitURIFragment(line);
+        const match =
+            /^mierus:\/\/([^:@/?]+):([^@/?]+)@(\[[^\]]+\]|[^:/?@\s]+)\/?\?(.+)$/i.exec(
+                content,
+            );
+        if (!match) throw new Error('Invalid Mieru URI');
+        const [, username, password, server, query] = match;
+
+        const params = new Map();
+        for (const part of query.split('&')) {
+            const { key, value } = splitQueryPart(part);
+            if (!params.has(key)) params.set(key, []);
+            params.get(key).push(value);
+        }
+        const ports = params.get('port') || [];
+        const protocols =
+            params.get('protocol') ?? params.get('transport') ?? [];
+        if (ports.length === 0 || ports.length !== protocols.length) {
+            throw new Error('Mieru URI requires matching ports and protocols');
+        }
+
+        const baseName = fragment || params.get('profile')?.[0] || server;
+        const proxy = {
+            type: 'mieru',
+            server,
+            username: decodeURIComponent(username),
+            password: decodeURIComponent(password),
+        };
+        // shortcut: 只映射 mihomo 支持的字段，需要保留完整 Mieru profile 时再透传 MTU。
+        for (const key of [
+            'multiplexing',
+            'handshake-mode',
+            'traffic-pattern',
+        ]) {
+            const value = params.get(key)?.[0];
+            if (value) proxy[key] = value;
+        }
+
+        return ports.map((port, index) => {
+            const transport = protocols[index].toUpperCase();
+            const [, first, last = first] =
+                /^(\d+)(?:-(\d+))?$/.exec(port) || [];
+            const start = Number(first);
+            const end = Number(last);
+            if (
+                !(1 <= start && start <= end && end <= 65535) ||
+                (transport !== 'TCP' && transport !== 'UDP')
+            ) {
+                throw new Error('Invalid Mieru port binding');
+            }
+            const binding = {
+                ...proxy,
+                name:
+                    ports.length === 1
+                        ? baseName
+                        : `${baseName}:${port}/${transport}`,
+                transport,
+            };
+            if (port.includes('-')) binding['port-range'] = port;
+            else binding.port = start;
+            return binding;
+        });
     };
     return { name, test, parse };
 }
@@ -2692,6 +2773,20 @@ function QX_AnyTLS() {
     return { name, test, parse };
 }
 
+function QX_Mieru() {
+    const name = 'QX Mieru Parser';
+    const test = (line) => /^mieru\s*=/.test(line);
+    const parse = (line) => getQXParser().parse(line);
+    return { name, test, parse };
+}
+
+function QX_Hysteria2() {
+    const name = 'QX Hysteria2 Parser';
+    const test = (line) => /^hysteria2\s*=/.test(line);
+    const parse = (line) => getQXParser().parse(line);
+    return { name, test, parse };
+}
+
 function QX_Trojan() {
     const name = 'QX Trojan Parser';
     const test = (line) => {
@@ -2743,15 +2838,11 @@ function Loon_SSR() {
     return { name, test, parse };
 }
 
+const LOON_VMESS = /^[^=,]*=\s*vmess\s*,[^,]*,[^,]*,[^,]*,\s*"/i;
+
 function Loon_VMess() {
     const name = 'Loon VMess Parser';
-    const test = (line) => {
-        // distinguish between surge vmess
-        return (
-            /^.*=\s*vmess/i.test(line.split(',')[0]) &&
-            line.indexOf('username') === -1
-        );
-    };
+    const test = (line) => LOON_VMESS.test(line);
     const parse = (line) => getLoonParser().parse(line);
     return { name, test, parse };
 }
@@ -2815,6 +2906,13 @@ function Loon_Socks5() {
 function Loon_Tailscale() {
     const name = 'Loon Tailscale Parser';
     const test = (line) => /^[^=,]*=\s*tailscale\s*(?:,|$)/i.test(line);
+    const parse = (line) => getLoonParser().parse(line);
+    return { name, test, parse };
+}
+
+function Loon_Mieru() {
+    const name = 'Loon Mieru Parser';
+    const test = (line) => /^[^=,]*=\s*mieru\s*,/i.test(line);
     const parse = (line) => getLoonParser().parse(line);
     return { name, test, parse };
 }
@@ -3001,7 +3099,8 @@ function Surge_VMess() {
     const test = (line) => {
         return (
             /^.*=\s*vmess/.test(line.split(',')[0]) &&
-            line.indexOf('username') !== -1
+            line.indexOf('username') !== -1 &&
+            !LOON_VMESS.test(line)
         );
     };
     const parse = (line) => getSurgeParser().parse(line);
@@ -3020,7 +3119,10 @@ function Surge_VLESS() {
 function Surge_Trojan() {
     const name = 'Surge Trojan Parser';
     const test = (line) => {
-        return /^.*=\s*trojan/.test(line.split(',')[0]);
+        return (
+            /^.*=\s*trojan/.test(line.split(',')[0]) &&
+            !/^[^=,]*=\s*trojan\s*,[^,]*,[^,]*,\s*"/.test(line)
+        );
     };
     const parse = (line) => getSurgeParser().parse(line);
     return { name, test, parse };
@@ -3126,12 +3228,18 @@ function Surge_External() {
     return { name, test, parse };
 }
 
-function Surge_Snell() {
-    const name = 'Surge Snell Parser';
-    const test = (line) => {
-        return /^.*=\s*snell/.test(line.split(',')[0]);
+function Snell() {
+    const name = 'Snell Parser';
+    const test = (line) => /^[^=,]*=\s*(?:snell|opensnell)\s*,/i.test(line);
+    const parse = (line) => {
+        const fields = line.match(/(?:[^",]+|"[^"]*")+/g).slice(3);
+        const loonOption =
+            /^(?:(?:udp|obfs-name|ip-mode|server-dns)\s*=|block-quic\s*=\s*(?:true|false)$)/;
+        const isLoon =
+            fields[0]?.trim().startsWith('"') ||
+            fields.some((field) => loonOption.test(field.trim()));
+        return (isLoon ? getLoonParser() : getSurgeParser()).parse(line);
     };
-    const parse = (line) => getSurgeParser().parse(line);
     return { name, test, parse };
 }
 
@@ -3188,6 +3296,7 @@ export default [
     URI_Hysteria2(),
     URI_Trojan(),
     URI_AnyTLS(),
+    URI_Mieru(),
     Clash_All(),
     Surge_Direct(),
     Surge_AnyTLS(),
@@ -3200,7 +3309,7 @@ export default [
     Surge_VLESS(),
     Surge_Trojan(),
     Surge_Http(),
-    Surge_Snell(),
+    Snell(),
     Surge_Tuic(),
     Surge_WireGuard(),
     Surge_Hysteria2(),
@@ -3217,11 +3326,14 @@ export default [
     Loon_Socks5(),
     Loon_WireGuard(),
     Loon_Tailscale(),
+    Loon_Mieru(),
     QX_SS(),
     QX_SSR(),
     QX_VMess(),
     QX_VLESS(),
     QX_AnyTLS(),
+    QX_Mieru(),
+    QX_Hysteria2(),
     QX_Trojan(),
     QX_Http(),
     QX_Socks5(),
