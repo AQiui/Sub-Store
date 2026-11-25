@@ -11,6 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: carsteneu/mystarhistory@v1
+        continue-on-error: true
         with:
-          repos: sub-store-org/Sub-Store
+          repos: ${{ github.repository }}
           token: ${{ secrets.STAR_HISTORY_TOKEN || github.token }}
